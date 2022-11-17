@@ -17,7 +17,7 @@ from collections import OrderedDict
 import math
 import numpy as np
 import time
-
+from ogb.graphproppred.mol_encoder import AtomEncoder, BondEncoder
 
 
 def binary_cross_entropy_weight(y_pred, y,has_weight=False, weight_length=1, weight_max=10):
@@ -39,6 +39,24 @@ def binary_cross_entropy_weight(y_pred, y,has_weight=False, weight_length=1, wei
         loss = F.binary_cross_entropy(y_pred, y)
     return loss
 
+def cross_entropy_weight(y_pred, y,has_weight=False, weight_length=1, weight_max=10):
+    '''
+
+    :param y_pred:
+    :param y:
+    :param weight_length: how long until the end of sequence shall we add weight
+    :param weight_value: the magnitude that the weight is enhanced
+    :return:
+    '''
+    if has_weight:
+        weight = torch.ones(y.size(0),y.size(1),y.size(2))
+        weight_linear = torch.arange(1,weight_length+1)/weight_length*weight_max
+        weight_linear = weight_linear.view(1,weight_length,1).repeat(y.size(0),1,y.size(2))
+        weight[:,-1*weight_length:,:] = weight_linear
+        loss = F.cross_entropy(y_pred, y, weight=weight.cuda())
+    else:
+        loss = F.cross_entropy(y_pred, y)
+    return loss
 
 def sample_tensor(y,sample=True, thresh=0.5):
     # do sampling
@@ -268,14 +286,16 @@ class LSTM_plain(nn.Module):
 
 # plain GRU model
 class GRU_plain(nn.Module):
-    def __init__(self, input_size, embedding_size, hidden_size, num_layers, has_input=True, has_output=False, output_size=None):
+    def __init__(self, input_size, embedding_size, hidden_size, num_layers,device='cpu', has_input=True, has_output=False, output_size=None):
         super(GRU_plain, self).__init__()
         self.num_layers = num_layers
         self.hidden_size = hidden_size
         self.has_input = has_input
         self.has_output = has_output
+        self.device = device
 
         if has_input:
+            self.atom_encoder = nn.Linear(6, embedding_size)
             self.input = nn.Linear(input_size, embedding_size)
             self.rnn = nn.GRU(input_size=embedding_size, hidden_size=hidden_size, num_layers=num_layers,
                               batch_first=True)
@@ -287,6 +307,7 @@ class GRU_plain(nn.Module):
                 nn.ReLU(),
                 nn.Linear(embedding_size, output_size)
             )
+            
 
         self.relu = nn.ReLU()
         # initialize
@@ -301,12 +322,14 @@ class GRU_plain(nn.Module):
             if isinstance(m, nn.Linear):
                 m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
 
-    def init_hidden(self, batch_size):
-        return Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)).cuda()
+    def init_hidden(self, batch_size, device="cuda"):
+        return Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)).to(self.device)
 
-    def forward(self, input_raw, pack=False, input_len=None):
+    def forward(self, input_raw, nodes=None, pack=False, input_len=None):
         if self.has_input:
             input = self.input(input_raw)
+            if nodes != None:
+                input = input + self.atom_encoder(nodes)
             input = self.relu(input)
         else:
             input = input_raw
@@ -321,23 +344,40 @@ class GRU_plain(nn.Module):
         return output_raw
 
 
-
-# a deterministic linear output
-class MLP_plain(nn.Module):
-    def __init__(self, h_size, embedding_size, y_size):
-        super(MLP_plain, self).__init__()
-        self.deterministic_output = nn.Sequential(
-            nn.Linear(h_size, embedding_size),
-            nn.ReLU(),
-            nn.Linear(embedding_size, y_size)
-        )
+class MLP_plain_regress(nn.Module):
+    def __init__(self, h_size, embedding_size, y_size = 1):
+        super(MLP_plain_regress, self).__init__()
+        self.lin1 = nn.Linear(h_size, embedding_size)
+        self.relu = nn.ReLU()
+        self.lin2 = nn.Linear(embedding_size, y_size)
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
-
     def forward(self, h):
-        y = self.deterministic_output(h)
+        y = self.lin1(h)
+        y = self.relu(y)
+        y = self.lin2(y)
+        return y
+
+# a deterministic linear output
+class MLP_plain(nn.Module):
+    def __init__(self, h_size, embedding_size, y_size, max_node):
+        super(MLP_plain, self).__init__()
+        self.max_node = max_node
+        self.y_size = y_size
+        self.lin1 = nn.Linear(h_size, embedding_size * max_node)
+        self.relu = nn.ReLU()
+        self.lin2 = nn.Linear(embedding_size * max_node, y_size * max_node)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                m.weight.data = init.xavier_uniform(m.weight.data, gain=nn.init.calculate_gain('relu'))
+    def forward(self, h):
+        y = self.lin1(h)
+        y = self.relu(y)
+        y = self.lin2(y)
+        y = y.view(y.size()[0], y.size()[1], self.max_node, self.y_size)
         return y
 
 # a deterministic linear output, additional output indicates if the sequence should continue grow
@@ -1496,5 +1536,71 @@ class Graphsage_Encoder(nn.Module):
         return(nodes_features)
 
 
+class CompleteGRNN(nn.Module):
+    def __init__(self, rnn_input, rnn, output, node_layer, num_layers, output_y_len, output_y_node_len, input_len):
+        super(CompleteGRNN, self).__init__()
+        self.rnn = rnn
+        self.output = output
+        self.node_layer = node_layer
+        self.rnn.hidden = rnn.init_hidden(batch_size=rnn_input.size(0))
+        if isinstance(self.output, GRU_plain):
+            self.output.hidden = output.init_hidden(batch_size=rnn_input.size(0)*rnn_input.size(1))
+        if isinstance(self.node_layer, GRU_plain):
+            self.node_layer.hidden = node_layer.init_hidden(batch_size=rnn_input.size(0)*rnn_input.size(1))
+        self.num_layers = num_layers
+        self.output_y_len = output_y_len
+        self.output_y_node_len = output_y_node_len
+        self.input_len = input_len
+
+    def forward(self, inp, output_x, output_x_nodes, inp_nodes):
+        h = self.rnn(inp, nodes=inp_nodes, pack=True, input_len=self.input_len)
+        h_mask = pack_padded_sequence(h,self.input_len,batch_first=True).data
+        if isinstance(self.output, MLP_plain):
+            y_pred = self.output(h)
+        else:
+            idx = [i for i in range(h_mask.size(0) - 1, -1, -1)]
+            idx = Variable(torch.LongTensor(idx)).cuda()
+            h_mask = h_mask.index_select(0, idx)
+            hidden_null = Variable(torch.zeros(self.num_layers-1, h_mask.size(0), h_mask.size(1))).cuda()
+            self.output.hidden = torch.cat((h_mask.view(1,h_mask.size(0),h_mask.size(1)),hidden_null),dim=0)
+            y_pred = self.output(output_x, pack=True, input_len=self.output_y_len)
+        if isinstance(self.node_layer, MLP_plain):
+            y_nodes_pred = self.node_layer(h)
+        else:
+            idx = [i for i in range(h_mask.size(0) - 1, -1, -1)]
+            idx = Variable(torch.LongTensor(idx)).cuda()
+            h_mask = h_mask.index_select(0, idx)
+            hidden_null = Variable(torch.zeros(self.num_layers-1, h_mask.size(0), h_mask.size(1))).cuda()
+            self.node_layer.hidden = torch.cat((h_mask.view(1,h_mask.size(0),h_mask.size(1)),hidden_null),dim=0)
+            y_nodes_pred = self.node_layer(output_x_nodes, pack=True, input_len=self.output_y_node_len)
+        return y_pred, y_nodes_pred
 
 
+# def forward(self, inp, output_x, output_x_nodes, inp_nodes):
+#         h = self.rnn(inp, nodes=inp_nodes, pack=True, input_len=self.input_len)
+#         print("hidden")
+#         print(h.shape)
+#         if isinstance(self.output, MLP_plain):
+#             print(h.shape)
+#             y_pred = self.output(h)
+#         else:
+#             h = pack_padded_sequence(h,self.input_len,batch_first=True).data 
+#             idx = [i for i in range(h.size(0) - 1, -1, -1)]
+#             idx = Variable(torch.LongTensor(idx)).cuda()
+#             h = h.index_select(0, idx)
+#             hidden_null = Variable(torch.zeros(self.num_layers-1, h.size(0), h.size(1))).cuda()
+#             self.output.hidden = torch.cat((h.view(1,h.size(0),h.size(1)),hidden_null),dim=0)
+#             print("input to edge")
+#             print(output_x.shape)
+#             y_pred = self.output(output_x, pack=True, input_len=self.output_y_len)
+#         if isinstance(self.node_layer, MLP_plain):
+#             y_nodes_pred = self.node_layer(h)
+#         else:
+#             h = pack_padded_sequence(h,self.input_len,batch_first=True).data 
+#             idx = [i for i in range(h.size(0) - 1, -1, -1)]
+#             idx = Variable(torch.LongTensor(idx)).cuda()
+#             h = h.index_select(0, idx)
+#             hidden_null = Variable(torch.zeros(self.num_layers-1, h.size(0), h.size(1))).cuda()
+#             self.node_layer.hidden = torch.cat((h.view(1,h.size(0),h.size(1)),hidden_null),dim=0)
+#             y_nodes_pred = self.node_layer(output_x_nodes, pack=True, input_len=self.output_y_node_len)
+#         return y_pred, y_nodes_pred

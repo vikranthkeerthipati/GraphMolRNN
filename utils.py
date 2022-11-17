@@ -13,19 +13,21 @@ from sklearn.decomposition import PCA
 import community
 import pickle
 import re
+from rdkit.Chem import AllChem as Chem
+from molecular_rectifier import Rectifier
 
-import data
+# import data
 
-def citeseer_ego():
-    _, _, G = data.Graph_load(dataset='citeseer')
-    G = max(nx.connected_component_subgraphs(G), key=len)
-    G = nx.convert_node_labels_to_integers(G)
-    graphs = []
-    for i in range(G.number_of_nodes()):
-        G_ego = nx.ego_graph(G, i, radius=3)
-        if G_ego.number_of_nodes() >= 50 and (G_ego.number_of_nodes() <= 400):
-            graphs.append(G_ego)
-    return graphs
+# def citeseer_ego():
+#     _, _, G = data.Graph_load(dataset='citeseer')
+#     G = max(nx.connected_component_subgraphs(G), key=len)
+#     G = nx.convert_node_labels_to_integers(G)
+#     graphs = []
+#     for i in range(G.number_of_nodes()):
+#         G_ego = nx.ego_graph(G, i, radius=3)
+#         if G_ego.number_of_nodes() >= 50 and (G_ego.number_of_nodes() <= 400):
+#             graphs.append(G_ego)
+#     return graphs
 
 def caveman_special(c=2,k=20,p_path=0.1,p_edge=0.3):
     p = p_path
@@ -433,6 +435,183 @@ def get_graph(adj):
     G = nx.from_numpy_matrix(adj)
     return G
 
+def get_raw_graph_nodes(adj, nodes):
+    adj = adj[~np.all(adj == 0, axis=1)]
+    adj = adj[:, ~np.all(adj == 0, axis=0)]
+    return get_mol_nodes(adj, nodes)
+
+def get_raw_mol_nodes(adj, nodes):
+    adj = np.array(adj)
+    mol = Chem.RWMol()
+    node_to_idx = {}
+    for begin_idx in range(adj.shape[0]):
+        for end_idx in range(adj.shape[1]):
+            if begin_idx == end_idx:
+                continue
+            # if(adj[begin_idx][end_idx] != 0 and adj[end_idx][begin_idx] != 0):
+                # print(adj[begin_idx][end_idx])
+                # print(adj[end_idx][begin_idx])
+                # print(Chem.BondType(int(adj[begin_idx][end_idx])))
+                # print("---------------------")
+            # print(adj[begin_idx][end_idx])SanitizeMol
+            if(adj[begin_idx][end_idx] != 0):
+                if not begin_idx in node_to_idx.keys():
+                    a=Chem.Atom(int(nodes[begin_idx][0]))
+                    a.SetFormalCharge(int(nodes[begin_idx][1]))
+                    a.SetChiralTag(Chem.rdchem.ChiralType.values[int(nodes[begin_idx][2])])
+                    a.SetHybridization(Chem.rdchem.HybridizationType.values[int(nodes[begin_idx][3])])
+                    a.SetNumExplicitHs(int(nodes[begin_idx][4]))
+                    a.SetIsAromatic(int(nodes[begin_idx][5]) == 1)
+                    idx = mol.AddAtom(a)
+                    node_to_idx[begin_idx] = idx
+                if not end_idx in node_to_idx.keys():
+                    a = Chem.Atom(int(nodes[end_idx][0]))
+                    a.SetFormalCharge(int(nodes[end_idx][1]))
+                    a.SetChiralTag(Chem.rdchem.ChiralType.values[int(nodes[end_idx][2])])
+                    a.SetHybridization(Chem.rdchem.HybridizationType.values[int(nodes[end_idx][3])])
+                    a.SetNumExplicitHs(int(nodes[end_idx][4]))
+                    a.SetIsAromatic(int(nodes[end_idx][5]) == 1)
+                    idx = mol.AddAtom(a)
+                    node_to_idx[end_idx] = idx
+                if mol.GetBondBetweenAtoms(begin_idx,end_idx) == None:
+                    mol.AddBond(node_to_idx[begin_idx], node_to_idx[end_idx], order=Chem.BondType(int(adj[begin_idx][end_idx])))
+    Chem.SanitizeMol(mol)
+    return mol
+
+    # mol = Chem.RWMol()
+    # atomic_nums = nx.get_node_attributes(G, 'atomic_num')
+    # chiral_tags = nx.get_node_attributes(G, 'chiral_tag')
+    # formal_charges = nx.get_node_attributes(G, 'formal_charge')
+    # node_is_aromatics = nx.get_node_attributes(G, 'is_aromatic')
+    # node_hybridizations = nx.get_node_attributes(G, 'hybridization')
+    # num_explicit_hss = nx.get_node_attributes(G, 'num_explicit_hs')
+    # node_to_idx = {}
+    # for node in G.nodes():
+    #     a=Chem.Atom(int(atomic_nums[node]))
+    #     a.SetFormalCharge(int(formal_charges[node]))
+    #     a.SetChiralTag(Chem.rdchem.ChiralType.values[int(chiral_tags[node])])
+    #     a.SetHybridization(Chem.rdchem.HybridizationType.values[int(node_hybridizations[node])])
+    #     a.SetNumExplicitHs(int(num_explicit_hss[node]))
+    #     a.SetIsAromatic(int(node_is_aromatics[node]) == 1)
+    #     idx = mol.AddAtom(a)
+    #     node_to_idx[node] = idx
+
+    # bond_types = nx.get_edge_attributes(G, 'bond_type')
+    # for edge in G.edges():
+    #     first, second = edge
+    #     ifirst = node_to_idx[first]
+    #     isecond = node_to_idx[second]
+    #     bond_type = bond_types[first, second]
+    #     mol.AddBond(int(ifirst), int(isecond), order=Chem.BondType(int(bond_type)))
+def get_mol_nodes(adj_inp, nodes):
+    # adj = adj[~np.all(adj == 0, axis=1)]
+    # adj = adj[:, ~np.all(adj == 0, axis=0)]
+    # adj = np.asmatrix(adj)
+    # print(adj.shape)
+    # print(adj[0].shape)
+    # print(adj[0][0].shape)
+    # print(adj[0][0])
+    # print("--------")
+    adj = np.array(adj_inp)
+    G = nx.Graph()
+    for begin_idx in range(adj.shape[0]):
+        for end_idx in range(adj.shape[1]):
+            if(adj[begin_idx][end_idx] != 0):
+                if not G.has_node(begin_idx):
+                    G.add_node(begin_idx,atomic_num=nodes[begin_idx][0],
+                                        formal_charge=nodes[begin_idx][1],
+                                        chiral_tag=nodes[begin_idx][2],
+                                        hybridization=nodes[begin_idx][3],
+                                        num_explicit_hs=nodes[begin_idx][4],
+                                        is_aromatic=nodes[begin_idx][5])
+
+                if not G.has_node(end_idx):
+                    G.add_node(end_idx,atomic_num=nodes[end_idx][0],
+                                        formal_charge=nodes[end_idx][1],
+                                        chiral_tag=nodes[end_idx][2],
+                                        hybridization=nodes[end_idx][3],
+                                        num_explicit_hs=nodes[end_idx][4],
+                                        is_aromatic=nodes[end_idx][5])
+                G.add_edge(begin_idx, end_idx, bond_type=adj[begin_idx][end_idx])
+    return G
+def nx_to_mol(G):
+    mol = Chem.RWMol()
+    atomic_nums = nx.get_node_attributes(G, 'atomic_num')
+    chiral_tags = nx.get_node_attributes(G, 'chiral_tag')
+    formal_charges = nx.get_node_attributes(G, 'formal_charge')
+    node_is_aromatics = nx.get_node_attributes(G, 'is_aromatic')
+    node_hybridizations = nx.get_node_attributes(G, 'hybridization')
+    num_explicit_hss = nx.get_node_attributes(G, 'num_explicit_hs')
+    node_to_idx = {}
+    for node in G.nodes():
+        a=Chem.Atom(int(atomic_nums[node]))
+        a.SetFormalCharge(int(formal_charges[node]))
+        a.SetChiralTag(Chem.rdchem.ChiralType.values[int(chiral_tags[node])])
+        a.SetHybridization(Chem.rdchem.HybridizationType.values[int(node_hybridizations[node])])
+        a.SetNumExplicitHs(int(num_explicit_hss[node]))
+        a.SetIsAromatic(int(node_is_aromatics[node]) == 1)
+        idx = mol.AddAtom(a)
+        node_to_idx[node] = idx
+
+    bond_types = nx.get_edge_attributes(G, 'bond_type')
+    for edge in G.edges():
+        first, second = edge
+        ifirst = node_to_idx[first]
+        isecond = node_to_idx[second]
+        bond_type = bond_types[first, second]
+        mol.AddBond(int(ifirst), int(isecond), order=Chem.BondType(int(bond_type)))
+
+    Chem.SanitizeMol(mol)
+    return mol
+# def nx_to_mol(G):
+#     mol = Chem.RWMol()
+#     atomic_nums = nx.get_node_attributes(G, 'atomic_num')
+#     chiral_tags = nx.get_node_attributes(G, 'chiral_tag')
+#     formal_charges = nx.get_node_attributes(G, 'formal_charge')
+#     node_is_aromatics = nx.get_node_attributes(G, 'is_aromatic')
+#     node_hybridizations = nx.get_node_attributes(G, 'hybridization')
+#     num_explicit_hss = nx.get_node_attributes(G, 'num_explicit_hs')
+#     node_to_idx = {}
+#     for node in G.nodes():
+#         a=Chem.Atom(int(atomic_nums[node]))
+#         a.SetFormalCharge(int(formal_charges[node]))
+#         a.SetChiralTag(Chem.rdchem.ChiralType.values[int(chiral_tags[node])])
+#         a.SetHybridization(Chem.rdchem.HybridizationType.values[int(node_hybridizations[node])])
+#         a.SetNumExplicitHs(int(num_explicit_hss[node]))
+#         a.SetIsAromatic(int(node_is_aromatics[node]) == 1)
+#         idx = mol.AddAtom(a)
+#         node_to_idx[node] = idx
+
+#     bond_types = nx.get_edge_attributes(G, 'bond_type')
+#     for edge in G.edges():
+#         first, second = edge
+#         ifirst = node_to_idx[first]
+#         isecond = node_to_idx[second]
+#         bond_type = bond_types[first, second]
+#         mol.AddBond(int(ifirst), int(isecond), order=Chem.BondType(int(bond_type)))
+
+#     Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL)
+#     return mol          
+def mol_to_nx(mol):
+    G = nx.Graph()
+
+    for atom in mol.GetAtoms():
+        G.add_node(atom.GetIdx(),
+                    atomic_num=int(atom.GetAtomicNum()),
+                    formal_charge=int(atom.GetFormalCharge()),
+                    chiral_tag=int(atom.GetChiralTag()),
+                    hybridization=int(atom.GetHybridization()),
+                    num_explicit_hs=int(atom.GetNumExplicitHs()),
+                    is_aromatic=int(atom.GetIsAromatic()),
+                    # num_radical=int(atom.getNumRadicalElectrons()),
+                    # isotype=int(atom.getIsotope)
+                    )
+
+    for bond in mol.GetBonds():
+        G.add_edge(bond.GetBeginAtomIdx(),
+                    bond.GetEndAtomIdx(),
+                    bond_type=bond.GetBondType())
+    return G
 # save a list of graphs
 def save_graph_list(G_list, fname):
     with open(fname, "wb") as f:

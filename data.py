@@ -16,7 +16,8 @@ import os
 import time
 from model import *
 from utils import *
-
+from rdkit import Chem
+from utils import get_graph
 
 
 
@@ -182,13 +183,14 @@ def bfs_seq(G, start_id):
 
 
 
-def encode_adj(adj, max_prev_node=10, is_full = False):
+def encode_adj(adj, nodes, max_prev_node=10, is_full = False):
     '''
 
     :param adj: n*n, rows means time step, while columns are input dimension
     :param max_degree: we want to keep row number, but truncate column numbers
     :return:
     '''
+    # print("1111111111111111")
     if is_full:
         max_prev_node = adj.shape[0]-1
 
@@ -200,35 +202,65 @@ def encode_adj(adj, max_prev_node=10, is_full = False):
     # use max_prev_node to truncate
     # note: now adj is a (n-1)*(n-1) matrix
     adj_output = np.zeros((adj.shape[0], max_prev_node))
-    for i in range(adj.shape[0]):
+    node_output = np.zeros((nodes.shape[1], max_prev_node))
+    for i in range(n):
         input_start = max(0, i - max_prev_node + 1)
         input_end = i + 1
         output_start = max_prev_node + input_start - input_end
         output_end = max_prev_node
+        node_output[:, output_start:output_end] = np.transpose(nodes[input_start:input_end, :], (1, 0))
+
+    for i in range(adj.shape[0]):
+        input_start = max(0, i - max_prev_node + 1)
+        input_end = i + 1
+
+        output_start = max_prev_node + input_start - input_end
+        output_end = max_prev_node
+
         adj_output[i, output_start:output_end] = adj[i, input_start:input_end]
+        # if i == 0
+        #     print("Enc Output start: %d\nEnc Output end:%d\nEnc Input start: %d, Enc Input End: %d" % (output_start, output_end, input_start, input_end))
         adj_output[i,:] = adj_output[i,:][::-1] # reverse order
+    node_output = node_output[::-1]
+    # print("999999999999999999999")
+    return adj_output, node_output
 
-    return adj_output
-
-def decode_adj(adj_output):
+def decode_adj(adj_output, node_output):
     '''
         recover to adj from adj_output
-        note: here adj_output have shape (n-1)*m
+        note: here adj_output have shape (n-1)*
     '''
+    # print("111111111111111")
     max_prev_node = adj_output.shape[1]
     adj = np.zeros((adj_output.shape[0], adj_output.shape[0]))
+    nodes = np.zeros((adj_output.shape[0] + 1, node_output.shape[0]))
+    node_output = node_output[::-1]
+
+    for i in range(adj_output.shape[0] + 1):
+        input_start = max(0, i - max_prev_node + 1)
+        input_end = i + 1
+        output_start = max_prev_node + input_start - input_end
+        output_end = max_prev_node
+        nodes[input_start:input_end,:] = np.transpose(node_output[:, output_start:output_end], (1,0))
+        # node_output[:, output_start:output_end] = np.transpose(nodes[input_start:input_end, :], (1, 0))
+
     for i in range(adj_output.shape[0]):
         input_start = max(0, i - max_prev_node + 1)
         input_end = i + 1
         output_start = max_prev_node + max(0, i - max_prev_node + 1) - (i + 1)
         output_end = max_prev_node
         adj[i, input_start:input_end] = adj_output[i,::-1][output_start:output_end] # reverse order
+        # print(nodes[input_start:input_end, :].shape)
+        # print(nodes[input_start:input_end,:].shape)
+        # if i == 0:
+            # print("Dec Output start: %d\nDec Output end:%d\nDec Input start: %d\nDec Input End: %d" % (output_start, output_end, input_start, input_end))
     adj_full = np.zeros((adj_output.shape[0]+1, adj_output.shape[0]+1))
     n = adj_full.shape[0]
     adj_full[1:n, 0:n-1] = np.tril(adj, 0)
     adj_full = adj_full + adj_full.T
-
-    return adj_full
+    # print(nodes_full)
+    # print("999999999999999")
+    return adj_full, nodes
 
 
 def encode_adj_flexible(adj):
@@ -385,11 +417,18 @@ def test_encode_decode_adj_full():
 ########## use pytorch dataloader
 class Graph_sequence_sampler_pytorch(torch.utils.data.Dataset):
     def __init__(self, G_list, max_num_node=None, max_prev_node=None, iteration=20000):
+        self.num_node_features = 1
         self.adj_all = []
         self.len_all = []
+        self.nodes = []
+        self.raw_graphs = []
         for G in G_list:
-            self.adj_all.append(np.asarray(nx.to_numpy_matrix(G)))
+            self.adj_all.append(nx.attr_matrix(G, edge_attr="bond_type")[0])
+            adj = nx.attr_matrix(G, edge_attr="bond_type")[0]
+            node_attr = np.array([np.array(list(G.nodes[n].values())) for n in range(G.number_of_nodes())])
+            self.nodes.append(node_attr)
             self.len_all.append(G.number_of_nodes())
+            self.raw_graphs.append(G)
         if max_num_node is None:
             self.n = max(self.len_all)
         else:
@@ -401,35 +440,44 @@ class Graph_sequence_sampler_pytorch(torch.utils.data.Dataset):
         else:
             self.max_prev_node = max_prev_node
 
-        # self.max_prev_node = max_prev_node
-
-        # # sort Graph in descending order
-        # len_batch_order = np.argsort(np.array(self.len_all))[::-1]
-        # self.len_all = [self.len_all[i] for i in len_batch_order]
-        # self.adj_all = [self.adj_all[i] for i in len_batch_order]
     def __len__(self):
         return len(self.adj_all)
     def __getitem__(self, idx):
+        raw_graph = self.raw_graphs[idx].copy()
         adj_copy = self.adj_all[idx].copy()
+        adj_copy_orig = adj_copy.copy()
+        node_copy = self.nodes[idx].copy()
+        node_orig = node_copy.copy()
         x_batch = np.zeros((self.n, self.max_prev_node))  # here zeros are padded for small graph
-        x_batch[0,:] = 1 # the first input token is all ones
+        x_batch[0,:] = -1 # the first input token is all negative ones
         y_batch = np.zeros((self.n, self.max_prev_node))  # here zeros are padded for small graph
+
+        x_batch_nodes = np.zeros((self.n + 1, node_copy.shape[-1]))
+        x_batch_nodes[0,:] = -1
+        y_batch_nodes = np.zeros((self.n, node_copy.shape[-1]))  # here zeros are padded for small graph
+
         # generate input x, y pairs
         len_batch = adj_copy.shape[0]
         x_idx = np.random.permutation(adj_copy.shape[0])
         adj_copy = adj_copy[np.ix_(x_idx, x_idx)]
+        node_copy = node_copy[x_idx]
+
         adj_copy_matrix = np.asmatrix(adj_copy)
         G = nx.from_numpy_matrix(adj_copy_matrix)
         # then do bfs in the permuted G
+
         start_idx = np.random.randint(adj_copy.shape[0])
         x_idx = np.array(bfs_seq(G, start_idx))
         adj_copy = adj_copy[np.ix_(x_idx, x_idx)]
-        adj_encoded = encode_adj(adj_copy.copy(), max_prev_node=self.max_prev_node)
-        # get x and y and adj
-        # for small graph the rest are zero padded
+        node_copy = node_copy[x_idx]
+
+        adj_encoded, node_encoded = encode_adj(adj_copy.copy(), node_copy.copy(), max_prev_node=self.max_prev_node)
+        adj_decoded, node_decoded = decode_adj(adj_encoded, node_encoded)
         y_batch[0:adj_encoded.shape[0], :] = adj_encoded
         x_batch[1:adj_encoded.shape[0] + 1, :] = adj_encoded
-        return {'x':x_batch,'y':y_batch, 'len':len_batch}
+        y_batch_nodes[0:node_copy.shape[0], :] = node_copy
+        x_batch_nodes[1:node_copy.shape[0] + 1, :] = node_copy
+        return {'x_bonds':x_batch,'y_bonds':y_batch, 'x_nodes': x_batch_nodes, 'y_nodes': y_batch_nodes, 'len': len_batch}
 
     def calc_max_prev_node(self, iter=20000,topk=10):
         max_prev_node = []

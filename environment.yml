@@ -1,4 +1,4 @@
-name: root
+name: graph-generation
 channels:
 - soumith
 - conda-forge

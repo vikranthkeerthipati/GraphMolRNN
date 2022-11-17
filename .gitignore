@@ -26,3 +26,9 @@ timing/
 
 __pycache__
 **/__pycache__
+
+models/
+runs/
+wandb/
+graph-generation/
+doctest-output/
